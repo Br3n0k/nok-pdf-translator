@@ -20,51 +20,49 @@ DEFAULT_LANGUAGE_LABEL = next(
     label for label, code in LANGUAGE_OPTIONS.items() if code == DEFAULT_LANGUAGE_CODE
 )
 
+def _build_translate_request(
+    temp_dir_path: Path,
+) -> Any:
+    """Create a translate handler bound to a temporary directory."""
 
-def translate_request(file: Any, language_label: str) -> tuple[Path, list[Image.Image]]:
-    """Sends a POST request to the translator server to translate a PDF.
+    def translate_request(
+        file: Any, language_label: str
+    ) -> tuple[str, list[Image.Image]]:
+        """Send a POST request to the translator server to translate a PDF."""
 
-    Parameters
-    ----------
-    file : Any
-        the PDF to be translated.
-    language_label : str
-        Human-readable label of the selected target language.
+        if file is None:
+            raise ValueError("No PDF uploaded.")
 
-    Returns
-    -------
-    tuple[Path, list[Image.Image]]
-        Path to the translated PDF and a list of images of the
-        translated PDF.
-    """
-    if file is None:
-        raise ValueError("No PDF uploaded.")
+        if language_label not in LANGUAGE_OPTIONS:
+            raise ValueError("Unsupported language selection.")
 
-    if language_label not in LANGUAGE_OPTIONS:
-        raise ValueError("Unsupported language selection.")
+        with open(file.name, "rb") as input_pdf:
+            response = requests.post(
+                TRANSLATE_URL,
+                files={"input_pdf": input_pdf},
+                data={"target_language": LANGUAGE_OPTIONS[language_label]},
+            )
 
-    with open(file.name, "rb") as input_pdf:
-        response = requests.post(
-            TRANSLATE_URL,
-            files={"input_pdf": input_pdf},
-            data={"target_language": LANGUAGE_OPTIONS[language_label]},
-        )
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            raise RuntimeError("Translation request failed") from exc
 
-    if response.status_code == 200:
-        with open(Path(temp_dir) / "translated.pdf", "wb") as f:
-            f.write(response.content)
+        output_path = temp_dir_path / "translated.pdf"
+        with open(output_path, "wb") as translated_pdf:
+            translated_pdf.write(response.content)
 
-        images = convert_from_path(Path(temp_dir) / "translated.pdf")
+        images = convert_from_path(output_path)
 
         requests.get(CLEAR_TEMP_URL)
-        return str(Path(temp_dir) / "translated.pdf"), images
-    else:
-        print(f"An error occurred: {response.status_code}")
+        return str(output_path), images
+
+    return translate_request
 
 
 if __name__ == "__main__":
-    global temp_dir
     with TemporaryDirectory() as temp_dir:
+        translate_request = _build_translate_request(Path(temp_dir))
         with gr.Blocks(theme="Soft") as demo:
             with gr.Column():
                 title = gr.Markdown("## PDF Translator")

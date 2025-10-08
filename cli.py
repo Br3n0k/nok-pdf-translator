@@ -46,13 +46,17 @@ def translate_request(
             data={"target_language": target_language},
         )
 
-    if response.status_code == 200:
-        with open(output_dir / input_pdf_path.name, "wb") as output_pdf:
-            output_pdf.write(response.content)
-        print(f"Converted PDF saved to {output_dir / input_pdf_path.name}")
-        requests.get(CLEAR_TEMP_URL)
-    else:
-        print(f"An error occurred: {response.status_code}")
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        raise RuntimeError(
+            "Translation request failed"
+        ) from exc
+
+    with open(output_dir / input_pdf_path.name, "wb") as output_pdf:
+        output_pdf.write(response.content)
+    print(f"Converted PDF saved to {output_dir / input_pdf_path.name}")
+    requests.get(CLEAR_TEMP_URL)
 
 
 def main(args: argparse.Namespace) -> None:
@@ -89,7 +93,7 @@ def main(args: argparse.Namespace) -> None:
             args.input_pdf_path_or_dir, args.output_dir, args.target_language
         )
     elif args.input_pdf_path_or_dir.is_dir():
-        input_pdf_paths = args.input_pdf_path_or_dir.glob("*.pdf")
+        input_pdf_paths = list(args.input_pdf_path_or_dir.glob("*.pdf"))
 
         if not input_pdf_paths:
             raise ValueError(f"Input directory is empty: {args.input_pdf_path_or_dir}")
