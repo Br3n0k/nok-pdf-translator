@@ -1,6 +1,7 @@
 NAME=pdf-translator
 TAG=0.1.0
 PROJECT_DIRECTORY=$(shell pwd)/..
+LANG?=ja
 
 build:
 	docker build -t ${NAME}:${TAG} .
@@ -28,5 +29,5 @@ run-bash:
 		${NAME}:${TAG} /bin/bash
 
 translate:
-	@cd ${PROJECT_DIRECTORY} && \
-		python3 cli.py -i ${INPUT}
+        @cd ${PROJECT_DIRECTORY} && \
+                python3 cli.py -i ${INPUT} -l ${LANG}
