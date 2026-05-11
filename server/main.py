@@ -2,15 +2,16 @@ import copy
 import re
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple, Union
+from typing import Dict, List, Tuple, Union
 
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 import PyPDF2
 import uvicorn
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pdf2image import convert_from_bytes, convert_from_path
 from PIL import Image, ImageDraw, ImageFont
@@ -20,7 +21,26 @@ from transformers import MarianMTModel, MarianTokenizer
 
 sys.path.append(str(Path(__file__).parent.parent))
 
-from utils import LayoutAnalyzer, OCRModel, fw_fill
+from utils import (
+    DEFAULT_LANGUAGE_CODE,
+    LANGUAGE_CONFIGS,
+    LayoutAnalyzer,
+    OCRModel,
+    normalize_language_code,
+)
+
+
+@dataclass
+class TranslationPipeline:
+    """Runtime resources for a translation target language."""
+
+    model: MarianMTModel
+    tokenizer: MarianTokenizer
+    config_code: str
+
+    @property
+    def config(self):
+        return LANGUAGE_CONFIGS[self.config_code]
 
 
 class InputPdf(BaseModel):
@@ -46,10 +66,8 @@ class TranslateApi:
         Layout model for detecting text blocks
     ocr_model: PaddleOCR
         OCR model for detecting text in the text blocks
-    translate_model: MarianMTModel
-        Translation model for translating text
-    translate_tokenizer: MarianTokenizer
-        Tokenizer for the translation model
+    translation_pipelines: Dict[str, TranslationPipeline]
+        Translation pipelines keyed by language code
     """
 
     DPI = 200
@@ -72,18 +90,26 @@ class TranslateApi:
         self.__load_models(model_root_dir)
         self.temp_dir = tempfile.TemporaryDirectory()
         self.temp_dir_name = Path(self.temp_dir.name)
+        self.translation_pipelines: Dict[str, TranslationPipeline] = {}
+        self.__load_translation_pipelines()
 
     def run(self):
         """Run the API server"""
         uvicorn.run(self.app, host="0.0.0.0", port=8765)
 
-    async def translate_pdf(self, input_pdf: UploadFile = File(...)) -> FileResponse:
+    async def translate_pdf(
+        self,
+        input_pdf: UploadFile = File(...),
+        target_language: str = Form(DEFAULT_LANGUAGE_CODE),
+    ) -> FileResponse:
         """API endpoint for translating PDF files.
 
         Parameters
         ----------
         input_pdf: UploadFile
             Input PDF file
+        target_language: str
+            Target language code for the translation.
 
         Returns
         -------
@@ -91,7 +117,8 @@ class TranslateApi:
             Translated PDF file
         """
         input_pdf_data = await input_pdf.read()
-        self._translate_pdf(input_pdf_data, self.temp_dir_name)
+        language_code = self.__validate_language(target_language)
+        self._translate_pdf(input_pdf_data, self.temp_dir_name, language_code)
 
         return FileResponse(
             self.temp_dir_name / "translated.pdf", media_type="application/pdf"
@@ -105,7 +132,7 @@ class TranslateApi:
         return {"message": "temp dir cleared"}
 
     def _translate_pdf(
-        self, pdf_path_or_bytes: Union[Path, bytes], output_dir: Path
+        self, pdf_path_or_bytes: Union[Path, bytes], output_dir: Path, language: str
     ) -> None:
         """Backend function for translating PDF files.
 
@@ -126,6 +153,8 @@ class TranslateApi:
             Path to the input PDF file or bytes of the input PDF file
         output_dir: Path
             Path to the output directory
+        language: str
+            Target language code for the translation
         """
         if isinstance(pdf_path_or_bytes, Path):
             pdf_images = convert_from_path(pdf_path_or_bytes, dpi=self.DPI)
@@ -140,6 +169,7 @@ class TranslateApi:
                 img, original_img, reached_references = self.__translate_one_page(
                     image=image,
                     reached_references=reached_references,
+                    language=language,
                 )
                 fig, ax = plt.subplots(1, 2, figsize=(20, 14))
                 ax[0].imshow(original_img)
@@ -187,22 +217,28 @@ class TranslateApi:
             model_root_dir=model_root_dir / "paddle-ocr", device=self.device
         )
 
-        self.translate_model = MarianMTModel.from_pretrained("staka/fugumt-en-ja").to(
-            self.device
-        )
-        self.translate_tokenizer = MarianTokenizer.from_pretrained("staka/fugumt-en-ja")
+    def __load_translation_pipelines(self):
+        """Load translation models for all supported languages."""
+
+        for code, config in LANGUAGE_CONFIGS.items():
+            model = MarianMTModel.from_pretrained(config.model_name).to(self.device)
+            tokenizer = MarianTokenizer.from_pretrained(config.tokenizer_name)
+            self.translation_pipelines[code] = TranslationPipeline(
+                model=model, tokenizer=tokenizer, config_code=code
+            )
 
     def __translate_one_page(
         self,
         image: Image.Image,
         reached_references: bool,
+        language: str,
     ) -> Tuple[np.ndarray, np.ndarray, bool]:
         """Translate one page of the PDF file.
 
         There are some heuristics to clean-up the results of translation:
             1. Remove newlines, tabs, brackets, slashes, and pipes
-            2. Reject the result if there are few Japanese characters
-            3. Skip the translation if the text block has only one line
+            2. Reject translations that do not match language-specific validators
+            3. Skip overly short translations to avoid noise
 
         Parameters
         ----------
@@ -210,6 +246,8 @@ class TranslateApi:
             Image of the page
         reached_references: bool
             Whether the references section has been reached.
+        language: str
+            Target language code for the translation.
 
         Returns
         -------
@@ -220,6 +258,8 @@ class TranslateApi:
         img = np.array(image, dtype=np.uint8)
         original_img = copy.deepcopy(img)
         result = self.layout_model(cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+        pipeline = self.translation_pipelines[language]
+
         for line in result:
             if line.type in ["text", "list"]:
                 ocr_results = list(map(lambda x: x[0], self.ocr_model(line.image)[1]))
@@ -227,24 +267,26 @@ class TranslateApi:
                 if len(ocr_results) > 1:
                     text = " ".join(ocr_results)
                     text = re.sub(r"\n|\t|\[|\]|\/|\|", " ", text)
-                    translated_text = self.__translate(text)
+                    translated_text = self.__translate(text, language)
 
-                    # if almost all characters in translated text are not japanese characters, skip
-                    if len(
-                        re.findall(
-                            r"[^\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF\u3400-\u4DBF]",
-                            translated_text,
-                        )
-                    ) > 0.8 * len(translated_text):
+                    if not translated_text.strip():
                         print("skipped")
                         continue
 
-                    # if text is too short, skip
-                    if len(translated_text) < 20:
+                    if pipeline.config.validator and not pipeline.config.validator(
+                        translated_text
+                    ):
                         print("skipped")
                         continue
 
-                    processed_text = fw_fill(
+                    if (
+                        pipeline.config.min_length
+                        and len(translated_text.strip()) < pipeline.config.min_length
+                    ):
+                        print("skipped")
+                        continue
+
+                    processed_text = pipeline.config.wrap_text(
                         translated_text,
                         width=int((line.bbox[2] - line.bbox[0]) / (self.FONT_SIZE / 2))
                         - 1,
@@ -281,7 +323,7 @@ class TranslateApi:
 
         return img, original_img, reached_references
 
-    def __translate(self, text: str) -> str:
+    def __translate(self, text: str, language: str) -> str:
         """Translate text using the translation model.
 
         If the text is too long, it will be splited with
@@ -291,6 +333,8 @@ class TranslateApi:
         ----------
         text: str
             Text to be translated.
+        language: str
+            Target language code.
 
         Returns
         -------
@@ -300,19 +344,42 @@ class TranslateApi:
         texts = self.__split_text(text, 448)
 
         translated_texts = []
+        pipeline = self.translation_pipelines[language]
         for i, t in enumerate(texts):
-            inputs = self.translate_tokenizer(t, return_tensors="pt").input_ids.to(
+            inputs = pipeline.tokenizer(t, return_tensors="pt").input_ids.to(
                 self.device
             )
-            outputs = self.translate_model.generate(inputs, max_length=512)
-            res = self.translate_tokenizer.decode(outputs[0], skip_special_tokens=True)
+            outputs = pipeline.model.generate(
+                inputs, max_length=pipeline.config.max_length
+            )
+            res = pipeline.tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-            # skip weird translations
-            if res.startswith("「この版"):
+            if pipeline.config.skip_prefixes and res.startswith(
+                pipeline.config.skip_prefixes
+            ):
                 continue
 
             translated_texts.append(res)
         return "".join(translated_texts)
+
+    def __validate_language(self, language: str) -> str:
+        """Validate a target language value provided by the API consumer."""
+
+        try:
+            normalized = normalize_language_code(language)
+        except ValueError as exc:  # pragma: no cover - FastAPI converts to JSON
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        if normalized not in self.translation_pipelines:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Requested language is supported but the corresponding "
+                    "translation pipeline is not loaded."
+                ),
+            )
+
+        return normalized
 
     def __split_text(self, text: str, text_limit: int = 448) -> List[str]:
         """Split text into chunks of sentences within text_limit.
